@@ -1,0 +1,51 @@
+#!/usr/bin/env node
+
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { Command } from "commander";
+import { DEFAULT_BACKEND_URL, type InferenceBackend } from "./config.js";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const pkg = JSON.parse(readFileSync(join(__dirname, "..", "package.json"), "utf-8")) as {
+  version: string;
+};
+
+const program = new Command();
+
+program
+  .name("gridlock-native-worker")
+  .description("Native headless worker for the Gridlock inference network")
+  .version(pkg.version)
+  .option("--wallet <pubkey>", "Solana wallet address (worker identity)")
+  .option("--url <url>", "Gridlock backend URL", DEFAULT_BACKEND_URL)
+  .option("--inference <backend>", "Inference backend: auto, ollama, or vllm", "auto")
+  .option("--benchmark", "Run benchmark only, then exit")
+  .action(async (opts: { wallet?: string; url: string; inference: string; benchmark?: boolean }) => {
+    const wallet = opts.wallet ?? process.env.GRIDLOCK_WALLET;
+    if (!wallet) {
+      console.error("Error: --wallet is required (or set GRIDLOCK_WALLET).");
+      process.exit(1);
+    }
+
+    const inference = opts.inference as InferenceBackend;
+    if (!["auto", "ollama", "vllm"].includes(inference)) {
+      console.error('Error: --inference must be "auto", "ollama", or "vllm".');
+      process.exit(1);
+    }
+
+    try {
+      const { startWorker } = await import("./worker.js");
+      await startWorker({
+        wallet,
+        backendUrl: opts.url,
+        inference,
+        benchmarkOnly: opts.benchmark ?? false,
+      });
+    } catch (err) {
+      console.error(`Fatal: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+program.parse();
