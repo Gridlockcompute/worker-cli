@@ -14,7 +14,7 @@ Headless GPU worker for the [Gridlock](https://grid-lock.tech) decentralized inf
 4. Executes inference jobs pushed by the router and reports TTFT, TPOT, and token counts
 5. Optionally computes attestation hashes for confidential (TEE) jobs
 
-Use the same Solana **public address** here as on the [web dashboard](https://grid-lock.tech/worker) so earnings, jobs, and connection status appear in one place.
+Use the same Solana **public address** here as on the [web dashboard](https://grid-lock.tech/worker) so earnings, jobs, and connection status appear in one place. Withdraw accumulated SOL from the worker dashboard on the web.
 
 ## Features
 
