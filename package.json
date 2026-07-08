@@ -1,0 +1,33 @@
+{
+  "name": "@gridlock/native-worker",
+  "version": "0.1.1",
+  "description": "Native CLI worker for the Gridlock inference network. Connects over WebSocket and runs jobs via Ollama or vLLM.",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "gridlock-native-worker": "./bin/gridlock-native-worker.cjs"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepack": "npm run build",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts"
+  },
+  "keywords": ["gridlock", "inference", "gpu", "ollama", "vllm", "worker", "evm", "robinhood"],
+  "dependencies": {
+    "commander": "^12.1.0",
+    "viem": "^2.23.2",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.19.4",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": ["dist", "bin", "README.md"]
+}
