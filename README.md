@@ -8,8 +8,8 @@ Headless GPU worker for the [Gridlock](https://grid-lock.tech) decentralized inf
 
 `worker-cli` (npm package `@gridlock/native-worker`) is the command-line worker client for operators who want to contribute GPU compute without a desktop UI. It:
 
-1. Detects your GPU and runs a short throughput benchmark
-2. Registers with the Gridlock router (`POST /v1/workers/register`)
+1. Detects your hardware (GPU or CPU) and runs a short throughput benchmark
+2. Registers with the Gridlock router (`POST /v1/workers/register`) and sets status **Active** so jobs can be dispatched
 3. Maintains REST heartbeats and a persistent WebSocket at `/v1/ws`
 4. Executes inference jobs pushed by the router and reports TTFT, TPOT, and token counts
 5. Optionally attaches a TEE attestation quote at registration and computes job attestation hashes for confidential work
@@ -20,9 +20,9 @@ Use the same **0x EVM address** here as on the [web worker dashboard](https://gr
 
 - **Headless operation** — no Electron, no browser; ideal for servers and Linux GPU boxes
 - **EVM identity** — validates `0x` addresses locally before registration
-- **Dual inference backends** — auto-detect Ollama or vLLM; bootstrap Ollama and pull a default model on first run
+- **Live terminal dashboard** — status table with uptime, jobs, throughput, queue depth, and a progress bar while inference runs
 - **WebSocket job dispatch** — real-time job push from the router with automatic reconnect
-- **GPU detection** — reports hardware tier at registration (via `nvidia-smi` where available)
+- **Hardware detection** — NVIDIA (`nvidia-smi`), AMD (`rocm-smi`), or `CPU · {model}` when no inference GPU is present
 - **Benchmark mode** — `--benchmark` runs throughput test and exits
 - **Confidential jobs** — registration attestation quote + per-job SHA-256 hash for TEE-tier work
 - **Configurable roles** — register as Prefill, Decode, or other worker roles via env/flag
@@ -83,7 +83,6 @@ node dist/index.js --wallet 0xYourEvmAddress
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--wallet <address>` | — | EVM wallet address `0x…` (**required**, or set `GRIDLOCK_WALLET`) |
-| `--url <url>` | `https://api.grid-lock.tech` | Gridlock router URL |
 | `--inference <backend>` | `auto` | `auto`, `ollama`, or `vllm` |
 | `--benchmark` | — | Run benchmark only, then exit |
 | `--version` | — | Print version |
@@ -94,7 +93,7 @@ node dist/index.js --wallet 0xYourEvmAddress
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GRIDLOCK_WALLET` | — | EVM address (alternative to `--wallet`) |
-| `GRIDLOCK_BACKEND_URL` | `https://api.grid-lock.tech` | Router API base URL |
+| `GRIDLOCK_BACKEND_URL` | `https://api.grid-lock.tech` | Override API URL for **local dev only** |
 | `GRIDLOCK_INFERENCE` | `auto` | Inference backend: `auto`, `ollama`, or `vllm` |
 | `GRIDLOCK_OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama API (local dev) |
 | `GRIDLOCK_OLLAMA_MODEL` | `llama3.1:8b` | Ollama model tag |
@@ -105,15 +104,17 @@ node dist/index.js --wallet 0xYourEvmAddress
 | `GRIDLOCK_ATTESTATION_QUOTE_FILE` | — | Path to production NRAS/SEV quote JSON for registration |
 | `GRIDLOCK_ATTESTATION_QUOTE_JSON` | — | Inline attestation quote JSON (alternative to file) |
 | `GRIDLOCK_TEE_TYPE` | `nvidia_cc` | TEE type in dev quotes (`nvidia_cc`, `amd_sev_snp`) |
+| `GRIDLOCK_PLAIN_LOGS` | — | Set `true` to disable the live dashboard and use plain log lines |
+
+Only **one worker process per wallet** is allowed. A second instance will exit immediately (lock file in `~/.gridlock/`).
 
 ### Local development
 
-Point at a local router instance:
+Override the hardcoded production API with `GRIDLOCK_BACKEND_URL`:
 
 ```bash
-gridlock-native-worker \
-  --wallet 0xYourEvmAddress \
-  --url http://127.0.0.1:8080
+export GRIDLOCK_BACKEND_URL=http://127.0.0.1:8081
+gridlock-native-worker --wallet 0xYourEvmAddress
 ```
 
 ## Usage examples

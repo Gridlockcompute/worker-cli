@@ -50,6 +50,45 @@ export function findOllamaBinary(): string | null {
   return null;
 }
 
+/** Install Ollama on Linux/macOS when missing (official install script). */
+export async function installOllama(): Promise<void> {
+  if (process.platform === "win32") {
+    throw new Error(
+      "Ollama is not installed.\n" +
+        "  1. Download from https://ollama.com/download\n" +
+        "  2. Install, then open Ollama from the Start menu\n" +
+        "  3. Re-run this worker",
+    );
+  }
+
+  if (process.env.GRIDLOCK_SKIP_OLLAMA_INSTALL === "true") {
+    throw new Error(
+      "Ollama is not installed. Set GRIDLOCK_SKIP_OLLAMA_INSTALL=false or install from https://ollama.com/download",
+    );
+  }
+
+  console.log("Ollama not found — installing via https://ollama.com/install.sh …");
+  const result = spawnSync("sh", ["-c", "curl -fsSL https://ollama.com/install.sh | sh"], {
+    stdio: "inherit",
+  });
+  if (result.status !== 0) {
+    throw new Error(
+      "Ollama install failed. Install manually: curl -fsSL https://ollama.com/install.sh | sh",
+    );
+  }
+}
+
+export async function resolveOllamaBinary(): Promise<string> {
+  const existing = findOllamaBinary();
+  if (existing) return existing;
+  await installOllama();
+  const binary = findOllamaBinary();
+  if (!binary) {
+    throw new Error("Ollama install completed but binary not found in PATH. Restart your shell and retry.");
+  }
+  return binary;
+}
+
 export function startOllamaServe(binary: string): void {
   const child = spawn(binary, ["serve"], {
     detached: true,
@@ -92,15 +131,7 @@ export async function ensureOllamaModel(baseUrl: string, binary: string, model: 
 }
 
 export async function bootstrapOllama(baseUrl: string, model: string): Promise<void> {
-  const binary = findOllamaBinary();
-  if (!binary) {
-    throw new Error(
-      "Ollama is not installed.\n" +
-        "  1. Download from https://ollama.com/download\n" +
-        "  2. Install, then open Ollama from the Start menu\n" +
-        `  3. Run: ollama pull ${model}`,
-    );
-  }
+  const binary = await resolveOllamaBinary();
 
   if (!(await checkOllamaAt(baseUrl))) {
     console.log("Ollama not running — starting it…");
@@ -108,7 +139,9 @@ export async function bootstrapOllama(baseUrl: string, model: string): Promise<v
     if (!(await waitForOllama(baseUrl))) {
       throw new Error(
         `Ollama did not respond at ${baseUrl}.\n` +
-          "  Open the Ollama app from the Start menu (system tray), wait a few seconds, then retry.",
+          (process.platform === "win32"
+            ? "  Open the Ollama app from the Start menu (system tray), wait a few seconds, then retry."
+            : "  Check: systemctl status ollama  — or run: ollama serve"),
       );
     }
   }

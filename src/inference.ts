@@ -13,8 +13,24 @@ import {
 import {
   bootstrapOllama,
   checkOllamaAt,
-  findOllamaBinary,
 } from "./ollama.js";
+
+export interface InferenceProgress {
+  tokens: number;
+  maxTokens: number;
+}
+
+export interface InferenceResult {
+  content: string;
+  tokens: number;
+  ttftMs: number;
+  tpotMs: number;
+}
+
+export interface InferenceOptions {
+  maxTokens?: number;
+  onProgress?: (progress: InferenceProgress) => void;
+}
 
 export interface ChatMessage {
   role: string;
@@ -53,20 +69,8 @@ async function ensureOllamaReady(): Promise<void> {
 
   const preferredUrl = process.env.GRIDLOCK_OLLAMA_URL?.replace(/\/$/, "") ?? OLLAMA_URL_CANDIDATES[0] ?? OLLAMA_URL;
   setOllamaUrl(preferredUrl);
-
-  const binary = findOllamaBinary();
-  if (binary) {
-    await bootstrapOllama(preferredUrl, OLLAMA_MODEL);
-    setOllamaUrl(preferredUrl);
-    return;
-  }
-
-  throw new Error(
-    "Ollama is not installed.\n" +
-      "  1. Download from https://ollama.com/download\n" +
-      "  2. Install, then open Ollama from the Start menu\n" +
-      `  3. Run: ollama pull ${OLLAMA_MODEL}`,
-  );
+  await bootstrapOllama(preferredUrl, OLLAMA_MODEL);
+  setOllamaUrl(preferredUrl);
 }
 
 export async function checkVllm(): Promise<boolean> {
@@ -97,18 +101,20 @@ export async function resolveInferenceBackend(preferred: InferenceBackend = INFE
     return activeBackend;
   }
 
-  // auto — prefer Ollama (works well on Windows), fall back to vLLM
+  // auto — prefer Ollama (installs on Linux/macOS if missing), fall back to vLLM
   if (await checkOllama()) {
     activeBackend = "ollama";
     activeModel = OLLAMA_MODEL;
     return activeBackend;
   }
 
-  if (findOllamaBinary()) {
+  try {
     await ensureOllamaReady();
     activeBackend = "ollama";
     activeModel = OLLAMA_MODEL;
     return activeBackend;
+  } catch (ollamaError) {
+    if (preferred !== "auto") throw ollamaError;
   }
 
   if (await checkVllm()) {
@@ -119,8 +125,8 @@ export async function resolveInferenceBackend(preferred: InferenceBackend = INFE
 
   throw new Error(
     "No inference server found.\n" +
-      `  • Ollama (recommended on Windows): https://ollama.com/download → open Ollama app → ollama pull ${OLLAMA_MODEL}\n` +
-      `  • vLLM (Linux/WSL): vllm serve meta-llama/Llama-3.1-8B-Instruct --port 8000\n` +
+      `  • Ollama: installs automatically on Linux/macOS, or https://ollama.com/download on Windows\n` +
+      `  • vLLM (Linux): vllm serve meta-llama/Llama-3.1-8B-Instruct --port 8000\n` +
       "Set GRIDLOCK_INFERENCE=ollama|vllm to force one backend.",
   );
 }
@@ -128,7 +134,8 @@ export async function resolveInferenceBackend(preferred: InferenceBackend = INFE
 async function runOllamaInference(
   messages: ChatMessage[],
   maxTokens: number,
-): Promise<{ content: string; tokens: number; ttftMs: number; tpotMs: number }> {
+  onProgress?: (progress: InferenceProgress) => void,
+): Promise<InferenceResult> {
   const start = performance.now();
   let firstTokenAt: number | null = null;
   let content = "";
@@ -166,12 +173,27 @@ async function runOllamaInference(
       const trimmed = line.trim();
       if (!trimmed) continue;
       try {
-        const chunk = JSON.parse(trimmed) as { message?: { content?: string } };
+        const chunk = JSON.parse(trimmed) as {
+          message?: { content?: string };
+          done?: boolean;
+          eval_count?: number;
+        };
         const piece = chunk.message?.content ?? "";
-        if (!piece) continue;
-        if (firstTokenAt === null) firstTokenAt = performance.now();
-        content += piece;
-        tokens += 1;
+        if (piece) {
+          if (firstTokenAt === null) firstTokenAt = performance.now();
+          content += piece;
+        }
+
+        const evalCount = Number(chunk.eval_count ?? 0);
+        if (evalCount > 0) {
+          tokens = evalCount;
+        } else if (piece) {
+          tokens = Math.max(tokens, Math.ceil(content.length / 4));
+        }
+
+        if (tokens > 0 && (piece || chunk.done)) {
+          onProgress?.({ tokens, maxTokens });
+        }
       } catch {
         /* skip */
       }
@@ -192,7 +214,8 @@ async function runOllamaInference(
 async function runVllmInference(
   messages: ChatMessage[],
   maxTokens: number,
-): Promise<{ content: string; tokens: number; ttftMs: number; tpotMs: number }> {
+  onProgress?: (progress: InferenceProgress) => void,
+): Promise<InferenceResult> {
   const start = performance.now();
   let firstTokenAt: number | null = null;
   let content = "";
@@ -235,12 +258,20 @@ async function runVllmInference(
       try {
         const chunk = JSON.parse(payload) as {
           choices?: { delta?: { content?: string } }[];
+          usage?: { completion_tokens?: number };
         };
         const piece = chunk.choices?.[0]?.delta?.content ?? "";
-        if (!piece) continue;
-        if (firstTokenAt === null) firstTokenAt = performance.now();
-        content += piece;
-        tokens += 1;
+        if (piece) {
+          if (firstTokenAt === null) firstTokenAt = performance.now();
+          content += piece;
+          tokens = Math.max(tokens, Math.ceil(content.length / 4));
+          onProgress?.({ tokens, maxTokens });
+        }
+        const usageTokens = Number(chunk.usage?.completion_tokens ?? 0);
+        if (usageTokens > 0) {
+          tokens = usageTokens;
+          onProgress?.({ tokens, maxTokens });
+        }
       } catch {
         /* skip */
       }
@@ -260,12 +291,25 @@ async function runVllmInference(
 
 export async function runInference(
   messages: ChatMessage[],
-  maxTokens = MAX_OUTPUT_TOKENS,
-): Promise<{ content: string; tokens: number; ttftMs: number; tpotMs: number }> {
+  maxTokensOrOptions: number | InferenceOptions = MAX_OUTPUT_TOKENS,
+  maybeOptions?: InferenceOptions,
+): Promise<InferenceResult> {
+  let maxTokens = MAX_OUTPUT_TOKENS;
+  let options: InferenceOptions | undefined;
+
+  if (typeof maxTokensOrOptions === "number") {
+    maxTokens = maxTokensOrOptions;
+    options = maybeOptions;
+  } else {
+    options = maxTokensOrOptions;
+    maxTokens = options.maxTokens ?? MAX_OUTPUT_TOKENS;
+  }
+
   const backend = getActiveBackend();
+  const onProgress = options?.onProgress;
   return backend === "ollama"
-    ? runOllamaInference(messages, maxTokens)
-    : runVllmInference(messages, maxTokens);
+    ? runOllamaInference(messages, maxTokens, onProgress)
+    : runVllmInference(messages, maxTokens, onProgress);
 }
 
 export async function runBenchmark(): Promise<number> {

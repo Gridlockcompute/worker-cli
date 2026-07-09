@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Command } from "commander";
-import { DEFAULT_BACKEND_URL, type InferenceBackend } from "./config.js";
+import { getBackendUrl, type InferenceBackend } from "./config.js";
 import { parseWorkerWallet } from "./wallet.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -19,10 +19,9 @@ program
   .description("Native headless worker for the Gridlock inference network")
   .version(pkg.version)
   .option("--wallet <address>", "EVM wallet address (worker identity)")
-  .option("--url <url>", "Gridlock backend URL", DEFAULT_BACKEND_URL)
   .option("--inference <backend>", "Inference backend: auto, ollama, or vllm", "auto")
   .option("--benchmark", "Run benchmark only, then exit")
-  .action(async (opts: { wallet?: string; url: string; inference: string; benchmark?: boolean }) => {
+  .action(async (opts: { wallet?: string; inference: string; benchmark?: boolean }) => {
     const walletRaw = opts.wallet ?? process.env.GRIDLOCK_WALLET;
     if (!walletRaw) {
       console.error("Error: --wallet is required (or set GRIDLOCK_WALLET to your 0x EVM address).");
@@ -47,7 +46,7 @@ program
       const { startWorker } = await import("./worker.js");
       await startWorker({
         wallet,
-        backendUrl: opts.url,
+        backendUrl: getBackendUrl(),
         inference,
         benchmarkOnly: opts.benchmark ?? false,
       });

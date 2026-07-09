@@ -1,8 +1,9 @@
 import WebSocket from "ws";
 import { resolveRegistrationAttestationQuote } from "./attestation-quote.js";
 import { printStartupBanner } from "./banner.js";
-import { wsUrl } from "./config.js";
-import { detectGpuName } from "./gpu.js";
+import { createDashboard, isDashboardMode, plainLog, type WorkerDashboard } from "./dashboard.js";
+import { wsUrl, MAX_OUTPUT_TOKENS } from "./config.js";
+import { detectHardwareTier } from "./gpu.js";
 import {
   getActiveModel,
   resolveInferenceBackend,
@@ -11,6 +12,8 @@ import {
   type ChatMessage,
 } from "./inference.js";
 import { computeJobAttestationHash } from "./attestation.js";
+import { acquireWorkerLock } from "./lock.js";
+import { startLiveStatsPoll } from "./live-stats.js";
 import { shortWallet, parseWorkerWallet } from "./wallet.js";
 import type { InferenceBackend } from "./config.js";
 
@@ -19,19 +22,22 @@ const HEARTBEAT_INTERVAL_MS = 15_000;
 /** WebSocket protocol + app pings — proxies (e.g. Cloudflare) drop idle sockets ~100–120s. */
 const WS_PING_INTERVAL_MS = 25_000;
 const RECONNECT_DELAY_MS = 3_000;
-
-interface WorkerOptions {
-  wallet: string;
-  backendUrl: string;
-  benchmarkOnly?: boolean;
-  inference?: InferenceBackend;
-}
+const DUPLICATE_DISCONNECT_THRESHOLD = 3;
 
 interface SessionContext {
   wallet: string;
   backendUrl: string;
   modelName: string;
   tokPerSec: number;
+  dashboard: WorkerDashboard;
+  onAlreadyConnected: () => void;
+}
+
+interface WorkerOptions {
+  wallet: string;
+  backendUrl: string;
+  benchmarkOnly?: boolean;
+  inference?: InferenceBackend;
 }
 
 async function apiPost<T>(base: string, path: string, body: unknown): Promise<T> {
@@ -49,6 +55,43 @@ async function apiPost<T>(base: string, path: string, body: unknown): Promise<T>
 
 async function sendHeartbeat(wallet: string, backendUrl: string): Promise<void> {
   await apiPost(backendUrl, "/v1/workers/heartbeat", { worker_address: wallet });
+}
+
+async function ensureWorkerActive(wallet: string, backendUrl: string): Promise<string> {
+  const base = backendUrl.replace(/\/$/, "");
+  const res = await fetch(`${base}/v1/workers/${wallet}/status`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ status: "Active" }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Set worker Active failed (${res.status}): ${text.slice(0, 200)}`);
+  }
+  const data = (await res.json()) as { status?: string };
+  return data.status ?? "Active";
+}
+
+async function fetchWorkerStats(
+  wallet: string,
+  backendUrl: string,
+): Promise<{ jobsToday: number; tokensToday: number; workerStatus: string }> {
+  try {
+    const res = await fetch(`${backendUrl.replace(/\/$/, "")}/v1/workers/${wallet}`);
+    if (!res.ok) return { jobsToday: 0, tokensToday: 0, workerStatus: "Active" };
+    const data = (await res.json()) as {
+      jobs_today?: number;
+      tokens_today?: number;
+      status?: string;
+    };
+    return {
+      jobsToday: Number(data.jobs_today ?? 0),
+      tokensToday: Number(data.tokens_today ?? 0),
+      workerStatus: data.status ?? "Active",
+    };
+  } catch {
+    return { jobsToday: 0, tokensToday: 0, workerStatus: "Active" };
+  }
 }
 
 async function ensureRegistered(wallet: string, backendUrl: string, hardwareTier: string) {
@@ -99,11 +142,19 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function runWebSocketSession(ctx: SessionContext): Promise<void> {
-  const { wallet, backendUrl, modelName, tokPerSec } = ctx;
+function runWebSocketSession(
+  ctx: SessionContext,
+  opts: {
+    isReconnect: boolean;
+    onQuickDisconnect: () => boolean;
+    onStableConnection: () => void;
+  },
+): Promise<void> {
+  const { wallet, backendUrl, modelName, tokPerSec, dashboard, onAlreadyConnected } = ctx;
   let activeJob: string | null = null;
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   let pingTimer: ReturnType<typeof setInterval> | null = null;
+  let connectedAt: number | null = null;
 
   const cleanup = () => {
     if (heartbeatTimer) clearInterval(heartbeatTimer);
@@ -112,11 +163,18 @@ function runWebSocketSession(ctx: SessionContext): Promise<void> {
     pingTimer = null;
   };
 
+  if (opts.isReconnect) {
+    dashboard.setConnection("reconnecting");
+  } else {
+    dashboard.setConnection("starting");
+  }
+
   return new Promise((resolve) => {
     const ws = new WebSocket(wsUrl(backendUrl));
 
     ws.on("open", () => {
-      log("Connected to router");
+      connectedAt = Date.now();
+      dashboard.setConnection("connected");
       ws.send(
         JSON.stringify({
           type: "worker:register",
@@ -126,15 +184,17 @@ function runWebSocketSession(ctx: SessionContext): Promise<void> {
           tok_per_sec: tokPerSec,
         }),
       );
-      log("Registered for jobs");
+      dashboard.note("Registered for jobs");
 
       void sendHeartbeat(wallet, backendUrl).catch((e) => {
-        log(`Heartbeat failed: ${e instanceof Error ? e.message : String(e)}`);
+        dashboard.note(`Heartbeat failed: ${e instanceof Error ? e.message : String(e)}`);
+        plainLog(`Heartbeat failed: ${e instanceof Error ? e.message : String(e)}`);
       });
 
       heartbeatTimer = setInterval(() => {
         void sendHeartbeat(wallet, backendUrl).catch((e) => {
-          log(`Heartbeat failed: ${e instanceof Error ? e.message : String(e)}`);
+          dashboard.note(`Heartbeat failed: ${e instanceof Error ? e.message : String(e)}`);
+          plainLog(`Heartbeat failed: ${e instanceof Error ? e.message : String(e)}`);
         });
       }, HEARTBEAT_INTERVAL_MS);
 
@@ -150,7 +210,43 @@ function runWebSocketSession(ctx: SessionContext): Promise<void> {
         try {
           const msg = JSON.parse(String(raw)) as Record<string, unknown>;
           if (msg.type === "error") {
-            log(`Error: ${String(msg.message ?? "unknown")}`);
+            const code = String(msg.code ?? "");
+            if (code === "worker_already_connected") {
+              dashboard.note("Wallet already connected — stop the other worker instance");
+              plainLog(
+                "Rejected: this wallet already has an active worker. Stop the other instance before starting a new one.",
+              );
+              onAlreadyConnected();
+              return;
+            }
+            dashboard.note(`Error: ${String(msg.message ?? "unknown")}`);
+            plainLog(`Error: ${String(msg.message ?? "unknown")}`);
+            return;
+          }
+          if (msg.type === "stats:update") {
+            const hasWorkerStats =
+              msg.jobs_today !== undefined
+              || msg.tokens_today !== undefined
+              || msg.jobs_failed_today !== undefined
+              || msg.worker_inflight !== undefined;
+
+            if (hasWorkerStats) {
+              dashboard.applyLiveStats({
+                jobsToday: Number(msg.jobs_today ?? 0),
+                tokensToday: Number(msg.tokens_today ?? 0),
+                jobsFailedToday: Number(msg.jobs_failed_today ?? 0),
+                workerStatus: String(msg.worker_status ?? "Active"),
+                wsTokPerSec: tokPerSec,
+                queueJobs: Number(msg.jobs_in_queue ?? 0),
+                inflightJobs: Number(msg.jobs_inflight ?? 0),
+                workerInflightJobs: Number(msg.worker_inflight ?? 0),
+              });
+            } else {
+              dashboard.update({
+                queueJobs: Number(msg.jobs_in_queue ?? 0),
+                inflightJobs: Number(msg.jobs_inflight ?? 0),
+              });
+            }
             return;
           }
           if (msg.type === "pong" || msg.type === "connected" || msg.type === "worker:registered") {
@@ -159,13 +255,21 @@ function runWebSocketSession(ctx: SessionContext): Promise<void> {
           if (msg.type !== "job:new" || activeJob) return;
 
           const jobId = String(msg.job_id);
+          const maxTokens = Number(msg.max_tokens ?? MAX_OUTPUT_TOKENS);
           activeJob = jobId;
-          log(`Job ${jobId.slice(0, 12)}…`);
+          const jobStartedAt = performance.now();
+          dashboard.setJob(jobId, maxTokens);
+          dashboard.note(`Job received ${jobId.slice(0, 12)}…`);
 
           const messages = (msg.messages as ChatMessage[]) ?? [];
           const confidential = msg.confidential === true || msg.sla_tier === "confidential";
           try {
-            const result = await runInference(messages);
+            const result = await runInference(messages, {
+              maxTokens,
+              onProgress: ({ tokens, maxTokens: limit }) => {
+                dashboard.setJobProgress(tokens, limit);
+              },
+            });
             const attestationHash = confidential
               ? computeJobAttestationHash(jobId, wallet, result.content)
               : null;
@@ -180,7 +284,9 @@ function runWebSocketSession(ctx: SessionContext): Promise<void> {
                 attestation_hash: attestationHash,
               }),
             );
-            log(`Job ${jobId.slice(0, 12)}… done (${result.tokens} tokens)`);
+            const elapsedMs = performance.now() - jobStartedAt;
+            dashboard.clearJob(true, result.tokens, elapsedMs);
+            dashboard.note(`Job ${jobId.slice(0, 12)}… done (${result.tokens} tokens)`);
           } catch (e) {
             ws.send(
               JSON.stringify({
@@ -189,24 +295,44 @@ function runWebSocketSession(ctx: SessionContext): Promise<void> {
                 error: e instanceof Error ? e.message : "Inference failed",
               }),
             );
-            log(`Job ${jobId.slice(0, 12)}… failed`);
+            const elapsedMs = performance.now() - jobStartedAt;
+            dashboard.clearJob(false, 0, elapsedMs);
+            dashboard.note(`Job ${jobId.slice(0, 12)}… failed`);
+            plainLog(`Job ${jobId.slice(0, 12)}… failed: ${e instanceof Error ? e.message : String(e)}`);
           } finally {
             activeJob = null;
           }
         } catch (e) {
-          log(`Message error: ${e instanceof Error ? e.message : String(e)}`);
+          dashboard.note(`Message error: ${e instanceof Error ? e.message : String(e)}`);
+          plainLog(`Message error: ${e instanceof Error ? e.message : String(e)}`);
         }
       })();
     });
 
-    ws.on("close", () => {
+    ws.on("close", (code, reason) => {
       cleanup();
-      log("Disconnected");
+      const livedMs = connectedAt ? Date.now() - connectedAt : 0;
+      if (livedMs >= 5000) {
+        opts.onStableConnection();
+      } else if (!activeJob && opts.onQuickDisconnect()) {
+        dashboard.note("Another worker instance is using this wallet — exiting");
+        plainLog(
+          "Disconnected repeatedly — another worker-cli process is registered with this wallet. Stop the duplicate instance.",
+        );
+        dashboard.setConnection("disconnected");
+        resolve();
+        return;
+      }
+
+      dashboard.setConnection("disconnected");
+      const detail = reason.toString() ? ` (${code} ${reason})` : ` (${code})`;
+      dashboard.note(`Disconnected from router${detail}`);
       resolve();
     });
 
     ws.on("error", (err) => {
-      log(`WebSocket error: ${err.message}`);
+      dashboard.note(`WebSocket error: ${err.message}`);
+      plainLog(`WebSocket error: ${err.message}`);
     });
   });
 }
@@ -214,48 +340,158 @@ function runWebSocketSession(ctx: SessionContext): Promise<void> {
 export async function startWorker(options: WorkerOptions): Promise<void> {
   const { wallet: rawWallet, backendUrl, benchmarkOnly, inference } = options;
   const wallet = parseWorkerWallet(rawWallet);
+  const dashboardMode = !benchmarkOnly && isDashboardMode();
 
   printStartupBanner();
 
-  const hardwareTier = await detectGpuName();
-  log(`Wallet: ${shortWallet(wallet)}`);
-  log(`API: ${backendUrl}`);
-  log(`GPU: ${hardwareTier}`);
-
+  const hardwareTier = await detectHardwareTier();
   const backend = await resolveInferenceBackend(inference);
-  log(`Inference: ${backend} (${getActiveModel()})`);
 
-  log("Running benchmark…");
+  if (!dashboardMode) {
+    log(`Wallet: ${shortWallet(wallet)}`);
+    log(`API: ${backendUrl}`);
+    log(`Hardware: ${hardwareTier}`);
+    log(`Inference: ${backend} (${getActiveModel()})`);
+    log("Running benchmark…");
+  }
+
+  let dashboard: WorkerDashboard | null = null;
+  if (dashboardMode) {
+    dashboard = createDashboard({
+      wallet: shortWallet(wallet),
+      api: backendUrl.replace(/^https?:\/\//, ""),
+      hardware: hardwareTier,
+      model: getActiveModel(),
+      inference: backend,
+      benchmarkTokPerSec: 0,
+      connection: "starting",
+      workerStatus: "Starting",
+      jobsCompleted: 0,
+      jobsFailed: 0,
+      jobsToday: 0,
+      tokensTodayBase: 0,
+      liveTokPerSec: null,
+      queueJobs: null,
+      inflightJobs: null,
+      workerInflightJobs: null,
+      currentJob: null,
+    });
+    dashboard.start();
+    dashboard.note("Running benchmark…");
+  }
+
   const tokPerSec = await runBenchmark();
-  log(`Benchmark: ${tokPerSec} tok/s`);
 
-  if (benchmarkOnly) return;
+  if (!dashboardMode) {
+    log(`Benchmark: ${tokPerSec} tok/s`);
+  } else if (dashboard) {
+    dashboard.update({ benchmarkTokPerSec: tokPerSec });
+    dashboard.note("Registering with router…");
+  }
+
+  if (benchmarkOnly) {
+    dashboard?.stop();
+    return;
+  }
+
+  const releaseLock = acquireWorkerLock(wallet);
 
   await ensureRegistered(wallet, backendUrl, hardwareTier);
+  const workerStats = await fetchWorkerStats(wallet, backendUrl);
+  const workerStatus = await ensureWorkerActive(wallet, backendUrl);
+
+  if (!dashboard) {
+    dashboard = createDashboard({
+      wallet: shortWallet(wallet),
+      api: backendUrl.replace(/^https?:\/\//, ""),
+      hardware: hardwareTier,
+      model: getActiveModel(),
+      inference: backend,
+      benchmarkTokPerSec: tokPerSec,
+      connection: "starting",
+      workerStatus,
+      jobsCompleted: 0,
+      jobsFailed: 0,
+      jobsToday: workerStats.jobsToday,
+      tokensTodayBase: workerStats.tokensToday,
+      liveTokPerSec: null,
+      queueJobs: null,
+      inflightJobs: null,
+      workerInflightJobs: null,
+      currentJob: null,
+    });
+    dashboard.start();
+  } else {
+    dashboard.update({
+      benchmarkTokPerSec: tokPerSec,
+      workerStatus,
+      jobsToday: workerStats.jobsToday,
+      tokensTodayBase: workerStats.tokensToday,
+    });
+  }
+
+  dashboard.note("Worker online — waiting for jobs");
+
+  let running = true;
+  const stopLiveStats = startLiveStatsPoll(wallet, backendUrl, dashboard, () => running);
 
   const session: SessionContext = {
     wallet,
     backendUrl,
     modelName: getActiveModel(),
     tokPerSec,
+    dashboard,
+    onAlreadyConnected: () => {
+      running = false;
+    },
   };
 
-  let running = true;
+  let quickDisconnects = 0;
+  let hadSession = false;
+
   const shutdown = () => {
     running = false;
-    log("Shutting down…");
+    stopLiveStats();
+    dashboard.note("Shutting down…");
+    dashboard.stop();
+    releaseLock();
+    plainLog("Shutting down…");
   };
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
 
   while (running) {
     try {
-      await runWebSocketSession(session);
+      await runWebSocketSession(session, {
+        isReconnect: hadSession,
+        onQuickDisconnect: () => {
+          quickDisconnects += 1;
+          if (quickDisconnects >= DUPLICATE_DISCONNECT_THRESHOLD) {
+            running = false;
+            return true;
+          }
+          return false;
+        },
+        onStableConnection: () => {
+          quickDisconnects = 0;
+        },
+      });
+      hadSession = true;
     } catch (e) {
-      log(`Session error: ${e instanceof Error ? e.message : String(e)}`);
+      dashboard.note(`Session error: ${e instanceof Error ? e.message : String(e)}`);
+      plainLog(`Session error: ${e instanceof Error ? e.message : String(e)}`);
     }
     if (!running) break;
-    log(`Reconnecting in ${RECONNECT_DELAY_MS / 1000}s…`);
+    if (quickDisconnects >= DUPLICATE_DISCONNECT_THRESHOLD) {
+      running = false;
+      break;
+    }
+    dashboard.setConnection("reconnecting");
+    dashboard.note(`Reconnecting in ${RECONNECT_DELAY_MS / 1000}s…`);
     await sleep(RECONNECT_DELAY_MS);
   }
+
+  dashboard.stop();
+  stopLiveStats();
+  releaseLock();
 }

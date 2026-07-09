@@ -1,8 +1,16 @@
-export const DEFAULT_BACKEND_URL =
-  process.env.GRIDLOCK_BACKEND_URL ?? "https://api.grid-lock.tech";
+/** Production Gridlock API — hardcoded default for all workers. */
+export const GRIDLOCK_API_URL = "https://api.grid-lock.tech";
+
+/** Override with GRIDLOCK_BACKEND_URL only for local router development. */
+export function getBackendUrl(): string {
+  return (process.env.GRIDLOCK_BACKEND_URL ?? GRIDLOCK_API_URL).replace(/\/$/, "");
+}
+
+/** @deprecated Use getBackendUrl() */
+export const DEFAULT_BACKEND_URL = getBackendUrl();
 
 /** Gridlock router — jobs, registration, WebSocket. */
-export const ROUTER_URL = DEFAULT_BACKEND_URL;
+export const ROUTER_URL = getBackendUrl();
 
 /** Local vLLM OpenAI-compatible API (separate process on your GPU machine). */
 export const VLLM_BASE_URL =
