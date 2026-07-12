@@ -1,4 +1,4 @@
-# worker-cli
+# native-worker
 
 Headless GPU worker for the [Gridlock](https://grid-lock.tech) decentralized inference network. Connects to the [router](https://github.com/Gridlockcompute/router) over WebSocket, registers your **EVM wallet** (`0x…` on Robinhood Chain) as operator identity, and runs chat jobs locally via **Ollama** or **vLLM**.
 
@@ -6,7 +6,7 @@ Headless GPU worker for the [Gridlock](https://grid-lock.tech) decentralized inf
 
 ## What it is
 
-`worker-cli` (npm package `@gridlock-compute/native-worker`) is the command-line worker client for operators who want to contribute GPU compute without a desktop UI. It:
+`native-worker` (npm package `@gridlock-compute/native-worker`) is the command-line worker client for operators who want to contribute GPU compute without a desktop UI. It:
 
 1. Detects your hardware (GPU or CPU) and runs a short throughput benchmark
 2. Registers with the Gridlock router (`POST /v1/workers/register`) and sets status **Active** so jobs can be dispatched
@@ -51,8 +51,8 @@ gridlock-native-worker --help
 **From source:**
 
 ```bash
-git clone https://github.com/Gridlockcompute/worker-cli.git
-cd worker-cli
+git clone https://github.com/Gridlockcompute/native-worker.git
+cd native-worker
 npm install
 npm run build
 ```
@@ -192,7 +192,7 @@ npm start            # node dist/index.js
 Project layout:
 
 ```
-worker-cli/
+native-worker/
 ├── src/
 │   ├── index.ts            # CLI entry (commander)
 │   ├── worker.ts           # WebSocket session + job loop
