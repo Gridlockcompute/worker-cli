@@ -14,20 +14,33 @@
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts"
   },
-  "keywords": ["gridlock", "inference", "gpu", "ollama", "vllm", "worker", "evm", "robinhood"],
+  "keywords": [
+    "gridlock",
+    "inference",
+    "gpu",
+    "ollama",
+    "vllm",
+    "worker",
+    "evm",
+    "robinhood"
+  ],
   "dependencies": {
     "commander": "^12.1.0",
     "viem": "^2.23.2",
-    "ws": "^8.18.0"
+    "ws": "^8.21.0"
   },
   "devDependencies": {
-    "@types/node": "^22.0.0",
-    "@types/ws": "^8.5.13",
-    "tsx": "^4.19.4",
-    "typescript": "^5.6.0"
+    "@types/node": "^22.20.1",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.23.0",
+    "typescript": "^5.9.3"
   },
   "engines": {
     "node": ">=18.0.0"
   },
-  "files": ["dist", "bin", "README.md"]
+  "files": [
+    "dist",
+    "bin",
+    "README.md"
+  ]
 }

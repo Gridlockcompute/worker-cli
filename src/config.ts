@@ -1,23 +1,28 @@
-/** Production Gridlock API — hardcoded default for all workers. */
+/** Gridlock API — all workers connect here. */
 export const GRIDLOCK_API_URL = "https://api.grid-lock.tech";
 
-/** Override with GRIDLOCK_BACKEND_URL only for local router development. */
 export function getBackendUrl(): string {
-  return (process.env.GRIDLOCK_BACKEND_URL ?? GRIDLOCK_API_URL).replace(/\/$/, "");
+  return GRIDLOCK_API_URL;
 }
 
 /** @deprecated Use getBackendUrl() */
-export const DEFAULT_BACKEND_URL = getBackendUrl();
+export const DEFAULT_BACKEND_URL = GRIDLOCK_API_URL;
 
 /** Gridlock router — jobs, registration, WebSocket. */
-export const ROUTER_URL = getBackendUrl();
+export const ROUTER_URL = GRIDLOCK_API_URL;
 
-/** Local vLLM OpenAI-compatible API (separate process on your GPU machine). */
-export const VLLM_BASE_URL =
-  (process.env.GRIDLOCK_VLLM_URL ?? "http://127.0.0.1:8000/v1").replace(/\/$/, "");
+const DEFAULT_OLLAMA_PORT = 11434;
+const DEFAULT_VLLM_PORT = 8000;
 
-/** Resolved at runtime after probing localhost / 127.0.0.1. */
-export let OLLAMA_URL = (process.env.GRIDLOCK_OLLAMA_URL ?? "http://127.0.0.1:11434").replace(/\/$/, "");
+/** vLLM OpenAI-compatible API on this machine (separate inference process). */
+export const VLLM_BASE_URL = (
+  process.env.GRIDLOCK_VLLM_URL ?? `http://127.0.0.1:${DEFAULT_VLLM_PORT}/v1`
+).replace(/\/$/, "");
+
+/** Resolved at runtime after probing Ollama on this host. */
+export let OLLAMA_URL = (
+  process.env.GRIDLOCK_OLLAMA_URL ?? `http://127.0.0.1:${DEFAULT_OLLAMA_PORT}`
+).replace(/\/$/, "");
 
 export function setOllamaUrl(url: string): void {
   OLLAMA_URL = url.replace(/\/$/, "");
@@ -25,8 +30,7 @@ export function setOllamaUrl(url: string): void {
 
 export const OLLAMA_URL_CANDIDATES = [
   process.env.GRIDLOCK_OLLAMA_URL?.replace(/\/$/, ""),
-  "http://127.0.0.1:11434",
-  "http://localhost:11434",
+  `http://127.0.0.1:${DEFAULT_OLLAMA_PORT}`,
 ].filter(Boolean) as string[];
 
 export type InferenceBackend = "auto" | "ollama" | "vllm";

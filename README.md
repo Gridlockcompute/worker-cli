@@ -64,9 +64,9 @@ node dist/index.js --help
 ## Quick start
 
 ```bash
-# 1. Install Ollama (https://ollama.com/download) or start vLLM locally
+# 1. Install Ollama (https://ollama.com/download) or start vLLM on this machine
 
-# 2. Start the worker (same wallets as registered with /worker)
+# 2. Start the worker — connects to https://api.grid-lock.tech
 gridlock-native-worker --wallet 0xYourEvmAddress
 ```
 
@@ -97,11 +97,11 @@ node dist/index.js --wallet 0xYourEvmAddress
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GRIDLOCK_WALLET` | — | EVM address (alternative to `--wallet`) |
-| `GRIDLOCK_BACKEND_URL` | `https://api.grid-lock.tech` | Override API URL for **local dev only** |
+| `GRIDLOCK_EARNINGS_WALLET` | operator wallet | Payout wallet sent at registration (`earnings_wallet`) |
 | `GRIDLOCK_INFERENCE` | `auto` | Inference backend: `auto`, `ollama`, or `vllm` |
-| `GRIDLOCK_OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama API (local dev) |
+| `GRIDLOCK_OLLAMA_URL` | Ollama on this machine (port 11434) | Override if Ollama listens elsewhere |
 | `GRIDLOCK_OLLAMA_MODEL` | `llama3.1:8b` | Ollama model tag |
-| `GRIDLOCK_VLLM_URL` | `http://127.0.0.1:8000/v1` | vLLM OpenAI-compatible API (local dev) |
+| `GRIDLOCK_VLLM_URL` | vLLM on this machine (port 8000) | OpenAI-compatible vLLM base URL |
 | `GRIDLOCK_VLLM_MODEL` | `meta-llama/Llama-3.1-8B-Instruct` | vLLM model id |
 | `GRIDLOCK_ROLE` | `Prefill` | Worker role sent at registration |
 | `GRIDLOCK_TEE_CAPABLE` | `false` | Set `true` to register as TEE-capable |
@@ -110,20 +110,13 @@ node dist/index.js --wallet 0xYourEvmAddress
 | `GRIDLOCK_TEE_TYPE` | `nvidia_cc` | TEE type in dev quotes (`nvidia_cc`, `amd_sev_snp`) |
 | `GRIDLOCK_PLAIN_LOGS` | — | Set `true` to disable the live dashboard and use plain log lines |
 
+All workers connect to **[https://api.grid-lock.tech](https://api.grid-lock.tech)** for registration, heartbeats, and WebSocket job dispatch. Inference (Ollama/vLLM) runs on your machine.
+
 Only **one worker process per wallet** is allowed. A second instance will exit immediately (lock file in `~/.gridlock/`).
-
-### Local development
-
-Override the hardcoded production API with `GRIDLOCK_BACKEND_URL`:
-
-```bash
-export GRIDLOCK_BACKEND_URL=http://127.0.0.1:8081
-gridlock-native-worker --wallet 0xYourEvmAddress
-```
 
 ## Usage examples
 
-**Standard production run:**
+**Standard run:**
 
 ```bash
 export GRIDLOCK_WALLET=0xYourEvmAddress
