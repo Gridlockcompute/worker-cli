@@ -13,7 +13,12 @@ import {
 import {
   bootstrapOllama,
   checkOllamaAt,
+  findOllamaBinary,
+  resolveOllamaModel,
 } from "./ollama.js";
+import { Worker } from "node:worker_threads";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 
 export interface InferenceProgress {
   tokens: number;
@@ -64,13 +69,18 @@ export async function checkOllama(): Promise<boolean> {
   return false;
 }
 
-async function ensureOllamaReady(): Promise<void> {
-  if (await checkOllama()) return;
+async function ensureOllamaReady(modelPreference?: string): Promise<string> {
+  if (!(await checkOllama())) {
+    const preferredUrl = process.env.GRIDLOCK_OLLAMA_URL?.replace(/\/$/, "") ?? OLLAMA_URL_CANDIDATES[0] ?? OLLAMA_URL;
+    setOllamaUrl(preferredUrl);
+    return bootstrapOllama(OLLAMA_URL, { preferred: modelPreference });
+  }
 
-  const preferredUrl = process.env.GRIDLOCK_OLLAMA_URL?.replace(/\/$/, "") ?? OLLAMA_URL_CANDIDATES[0] ?? OLLAMA_URL;
-  setOllamaUrl(preferredUrl);
-  await bootstrapOllama(preferredUrl, OLLAMA_MODEL);
-  setOllamaUrl(preferredUrl);
+  const binary = findOllamaBinary();
+  if (!binary) {
+    return bootstrapOllama(OLLAMA_URL, { preferred: modelPreference });
+  }
+  return resolveOllamaModel(OLLAMA_URL, binary, { preferred: modelPreference });
 }
 
 export async function checkVllm(): Promise<boolean> {
@@ -82,11 +92,13 @@ export async function checkVllm(): Promise<boolean> {
   }
 }
 
-export async function resolveInferenceBackend(preferred: InferenceBackend = INFERENCE_BACKEND): Promise<ActiveBackend> {
+export async function resolveInferenceBackend(
+  preferred: InferenceBackend = INFERENCE_BACKEND,
+  modelPreference?: string,
+): Promise<ActiveBackend> {
   if (preferred === "ollama") {
-    await ensureOllamaReady();
+    activeModel = await ensureOllamaReady(modelPreference);
     activeBackend = "ollama";
-    activeModel = OLLAMA_MODEL;
     return activeBackend;
   }
 
@@ -103,15 +115,14 @@ export async function resolveInferenceBackend(preferred: InferenceBackend = INFE
 
   // auto — prefer Ollama (installs on Linux/macOS if missing), fall back to vLLM
   if (await checkOllama()) {
+    activeModel = await ensureOllamaReady(modelPreference);
     activeBackend = "ollama";
-    activeModel = OLLAMA_MODEL;
     return activeBackend;
   }
 
   try {
-    await ensureOllamaReady();
+    activeModel = await ensureOllamaReady(modelPreference);
     activeBackend = "ollama";
-    activeModel = OLLAMA_MODEL;
     return activeBackend;
   } catch (ollamaError) {
     if (preferred !== "auto") throw ollamaError;
@@ -136,79 +147,60 @@ async function runOllamaInference(
   maxTokens: number,
   onProgress?: (progress: InferenceProgress) => void,
 ): Promise<InferenceResult> {
-  const start = performance.now();
-  let firstTokenAt: number | null = null;
-  let content = "";
-  let tokens = 0;
+  const model = activeModel || OLLAMA_MODEL;
+  const workerPath = join(dirname(fileURLToPath(import.meta.url)), "inference-ollama-worker.js");
 
-  const res = await fetch(`${OLLAMA_URL}/api/chat`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: OLLAMA_MODEL,
-      messages,
-      stream: true,
-      options: { num_predict: maxTokens },
-    }),
-  });
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(workerPath);
+    let settled = false;
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Ollama error ${res.status}: ${text.slice(0, 200)}`);
-  }
-  if (!res.body) throw new Error("Ollama returned empty body");
+    const finish = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      void worker.terminate();
+      fn();
+    };
 
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() ?? "";
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      try {
-        const chunk = JSON.parse(trimmed) as {
-          message?: { content?: string };
-          done?: boolean;
-          eval_count?: number;
-        };
-        const piece = chunk.message?.content ?? "";
-        if (piece) {
-          if (firstTokenAt === null) firstTokenAt = performance.now();
-          content += piece;
-        }
-
-        const evalCount = Number(chunk.eval_count ?? 0);
-        if (evalCount > 0) {
-          tokens = evalCount;
-        } else if (piece) {
-          tokens = Math.max(tokens, Math.ceil(content.length / 4));
-        }
-
-        if (tokens > 0 && (piece || chunk.done)) {
-          onProgress?.({ tokens, maxTokens });
-        }
-      } catch {
-        /* skip */
+    worker.on("message", (msg: {
+      type: string;
+      tokens?: number;
+      maxTokens?: number;
+      result?: InferenceResult;
+      error?: string;
+    }) => {
+      if (msg.type === "progress") {
+        onProgress?.({
+          tokens: Number(msg.tokens ?? 0),
+          maxTokens: Number(msg.maxTokens ?? maxTokens),
+        });
+        return;
       }
-    }
-  }
+      if (msg.type === "done" && msg.result) {
+        finish(() => resolve(msg.result!));
+        return;
+      }
+      if (msg.type === "error") {
+        finish(() => reject(new Error(msg.error ?? "Ollama worker failed")));
+      }
+    });
 
-  const end = performance.now();
-  const ttftMs = Math.floor((firstTokenAt ?? end) - start);
-  const outputTokens = Math.max(tokens, 1);
-  const tpotMs =
-    outputTokens > 1 && firstTokenAt
-      ? Math.floor((end - firstTokenAt) / (outputTokens - 1))
-      : 0;
+    worker.on("error", (err) => {
+      finish(() => reject(err));
+    });
 
-  return { content: content.trim() || "(empty)", tokens: outputTokens, ttftMs, tpotMs };
+    worker.on("exit", (code) => {
+      if (!settled && code !== 0) {
+        finish(() => reject(new Error(`Ollama worker exited (${code ?? "unknown"})`)));
+      }
+    });
+
+    worker.postMessage({
+      url: OLLAMA_URL,
+      model,
+      messages,
+      maxTokens,
+    });
+  });
 }
 
 async function runVllmInference(

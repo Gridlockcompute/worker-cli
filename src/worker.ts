@@ -38,6 +38,7 @@ interface WorkerOptions {
   backendUrl: string;
   benchmarkOnly?: boolean;
   inference?: InferenceBackend;
+  model?: string;
 }
 
 async function apiPost<T>(base: string, path: string, body: unknown): Promise<T> {
@@ -143,6 +144,61 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+interface QueuedJob {
+  jobId: string;
+  maxTokens: number;
+  messages: ChatMessage[];
+  confidential: boolean;
+}
+
+async function executeJobBody(
+  ws: WebSocket,
+  ctx: SessionContext,
+  job: QueuedJob,
+): Promise<void> {
+  const { wallet, dashboard } = ctx;
+  const { jobId, maxTokens, messages, confidential } = job;
+  const jobStartedAt = performance.now();
+
+  try {
+    const result = await runInference(messages, {
+      maxTokens,
+      onProgress: ({ tokens, maxTokens: limit }) => {
+        dashboard.setJobProgress(tokens, limit);
+      },
+    });
+    const attestationHash = confidential
+      ? computeJobAttestationHash(jobId, wallet, result.content)
+      : null;
+    const elapsedMs = performance.now() - jobStartedAt;
+    dashboard.note(`Job ${jobId.slice(0, 12)}… done (${result.tokens} tokens)`);
+    dashboard.clearJob(jobId, true, result.tokens, elapsedMs);
+    ws.send(
+      JSON.stringify({
+        type: "job:complete",
+        job_id: jobId,
+        response: result.content,
+        tokens_generated: result.tokens,
+        ttft_ms: result.ttftMs,
+        tpot_ms: result.tpotMs,
+        attestation_hash: attestationHash,
+      }),
+    );
+  } catch (e) {
+    const elapsedMs = performance.now() - jobStartedAt;
+    dashboard.note(`Job ${jobId.slice(0, 12)}… failed`);
+    dashboard.clearJob(jobId, false, 0, elapsedMs);
+    ws.send(
+      JSON.stringify({
+        type: "job:error",
+        job_id: jobId,
+        error: e instanceof Error ? e.message : "Inference failed",
+      }),
+    );
+    plainLog(`Job ${jobId.slice(0, 12)}… failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
 function runWebSocketSession(
   ctx: SessionContext,
   opts: {
@@ -152,7 +208,25 @@ function runWebSocketSession(
   },
 ): Promise<void> {
   const { wallet, backendUrl, modelName, tokPerSec, dashboard, onAlreadyConnected } = ctx;
-  let activeJob: string | null = null;
+  let jobChain: Promise<void> = Promise.resolve();
+  let jobsInFlight = 0;
+
+  const enqueueJob = (ws: WebSocket, job: QueuedJob) => {
+    jobsInFlight += 1;
+    dashboard.setJob(job.jobId, job.maxTokens);
+    dashboard.note(`Job received ${job.jobId.slice(0, 12)}…`);
+    jobChain = jobChain
+      .then(() => executeJobBody(ws, ctx, job))
+      .catch((e) => {
+        dashboard.note(`Job queue error: ${e instanceof Error ? e.message : String(e)}`);
+        plainLog(`Job queue error: ${e instanceof Error ? e.message : String(e)}`);
+      })
+      .finally(() => {
+        jobsInFlight = Math.max(0, jobsInFlight - 1);
+      });
+  };
+
+  const hasActiveWork = () => jobsInFlight > 0;
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   let pingTimer: ReturnType<typeof setInterval> | null = null;
   let connectedAt: number | null = null;
@@ -207,107 +281,69 @@ function runWebSocketSession(
     });
 
     ws.on("message", (raw) => {
-      void (async () => {
-        try {
-          const msg = JSON.parse(String(raw)) as Record<string, unknown>;
-          if (msg.type === "error") {
-            const code = String(msg.code ?? "");
-            if (code === "worker_already_connected") {
-              dashboard.note("Wallet already connected — stop the other worker instance");
-              plainLog(
-                "Rejected: this wallet already has an active worker. Stop the other instance before starting a new one.",
-              );
-              onAlreadyConnected();
-              return;
-            }
-            dashboard.note(`Error: ${String(msg.message ?? "unknown")}`);
-            plainLog(`Error: ${String(msg.message ?? "unknown")}`);
-            return;
-          }
-          if (msg.type === "stats:update") {
-            const hasWorkerStats =
-              msg.jobs_today !== undefined
-              || msg.tokens_today !== undefined
-              || msg.jobs_failed_today !== undefined
-              || msg.worker_inflight !== undefined;
+      let msg: Record<string, unknown>;
+      try {
+        msg = JSON.parse(String(raw)) as Record<string, unknown>;
+      } catch (e) {
+        dashboard.note(`Message error: ${e instanceof Error ? e.message : String(e)}`);
+        plainLog(`Message error: ${e instanceof Error ? e.message : String(e)}`);
+        return;
+      }
 
-            if (hasWorkerStats) {
-              dashboard.applyLiveStats({
-                jobsToday: Number(msg.jobs_today ?? 0),
-                tokensToday: Number(msg.tokens_today ?? 0),
-                jobsFailedToday: Number(msg.jobs_failed_today ?? 0),
-                workerStatus: String(msg.worker_status ?? "Active"),
-                wsTokPerSec: tokPerSec,
-                queueJobs: Number(msg.jobs_in_queue ?? 0),
-                inflightJobs: Number(msg.jobs_inflight ?? 0),
-                workerInflightJobs: Number(msg.worker_inflight ?? 0),
-              });
-            } else {
-              dashboard.update({
-                queueJobs: Number(msg.jobs_in_queue ?? 0),
-                inflightJobs: Number(msg.jobs_inflight ?? 0),
-              });
-            }
-            return;
-          }
-          if (msg.type === "pong" || msg.type === "connected" || msg.type === "worker:registered") {
-            return;
-          }
-          if (msg.type !== "job:new" || activeJob) return;
-
-          const jobId = String(msg.job_id);
-          const maxTokens = Number(msg.max_tokens ?? MAX_OUTPUT_TOKENS);
-          activeJob = jobId;
-          const jobStartedAt = performance.now();
-          dashboard.setJob(jobId, maxTokens);
-          dashboard.note(`Job received ${jobId.slice(0, 12)}…`);
-
-          const messages = (msg.messages as ChatMessage[]) ?? [];
-          const confidential = msg.confidential === true || msg.sla_tier === "confidential";
-          try {
-            const result = await runInference(messages, {
-              maxTokens,
-              onProgress: ({ tokens, maxTokens: limit }) => {
-                dashboard.setJobProgress(tokens, limit);
-              },
-            });
-            const attestationHash = confidential
-              ? computeJobAttestationHash(jobId, wallet, result.content)
-              : null;
-            ws.send(
-              JSON.stringify({
-                type: "job:complete",
-                job_id: jobId,
-                response: result.content,
-                tokens_generated: result.tokens,
-                ttft_ms: result.ttftMs,
-                tpot_ms: result.tpotMs,
-                attestation_hash: attestationHash,
-              }),
-            );
-            const elapsedMs = performance.now() - jobStartedAt;
-            dashboard.clearJob(true, result.tokens, elapsedMs);
-            dashboard.note(`Job ${jobId.slice(0, 12)}… done (${result.tokens} tokens)`);
-          } catch (e) {
-            ws.send(
-              JSON.stringify({
-                type: "job:error",
-                job_id: jobId,
-                error: e instanceof Error ? e.message : "Inference failed",
-              }),
-            );
-            const elapsedMs = performance.now() - jobStartedAt;
-            dashboard.clearJob(false, 0, elapsedMs);
-            dashboard.note(`Job ${jobId.slice(0, 12)}… failed`);
-            plainLog(`Job ${jobId.slice(0, 12)}… failed: ${e instanceof Error ? e.message : String(e)}`);
-          } finally {
-            activeJob = null;
-          }
-        } catch (e) {
-          dashboard.note(`Message error: ${e instanceof Error ? e.message : String(e)}`);
-          plainLog(`Message error: ${e instanceof Error ? e.message : String(e)}`);
+      if (msg.type === "error") {
+        const code = String(msg.code ?? "");
+        if (code === "worker_already_connected") {
+          dashboard.note("Wallet already connected — stop the other worker instance");
+          plainLog(
+            "Rejected: this wallet already has an active worker. Stop the other instance before starting a new one.",
+          );
+          onAlreadyConnected();
+          return;
         }
-      })();
+        dashboard.note(`Error: ${String(msg.message ?? "unknown")}`);
+        plainLog(`Error: ${String(msg.message ?? "unknown")}`);
+        return;
+      }
+
+      if (msg.type === "stats:update") {
+        const hasWorkerStats =
+          msg.jobs_today !== undefined
+          || msg.tokens_today !== undefined
+          || msg.jobs_failed_today !== undefined
+          || msg.worker_inflight !== undefined;
+
+        if (hasWorkerStats) {
+          dashboard.applyLiveStats({
+            jobsToday: Number(msg.jobs_today ?? 0),
+            tokensToday: Number(msg.tokens_today ?? 0),
+            jobsFailedToday: Number(msg.jobs_failed_today ?? 0),
+            workerStatus: String(msg.worker_status ?? "Active"),
+            wsTokPerSec: tokPerSec,
+            queueJobs: Number(msg.jobs_in_queue ?? 0),
+            inflightJobs: Number(msg.jobs_inflight ?? 0),
+            workerInflightJobs: Number(msg.worker_inflight ?? 0),
+          });
+        } else {
+          dashboard.update({
+            queueJobs: Number(msg.jobs_in_queue ?? 0),
+            inflightJobs: Number(msg.jobs_inflight ?? 0),
+          });
+        }
+        return;
+      }
+
+      if (msg.type === "pong" || msg.type === "connected" || msg.type === "worker:registered") {
+        return;
+      }
+
+      if (msg.type === "job:new") {
+        enqueueJob(ws, {
+          jobId: String(msg.job_id),
+          maxTokens: Number(msg.max_tokens ?? MAX_OUTPUT_TOKENS),
+          messages: (msg.messages as ChatMessage[]) ?? [],
+          confidential: msg.confidential === true || msg.sla_tier === "confidential",
+        });
+      }
     });
 
     ws.on("close", (code, reason) => {
@@ -315,7 +351,7 @@ function runWebSocketSession(
       const livedMs = connectedAt ? Date.now() - connectedAt : 0;
       if (livedMs >= 5000) {
         opts.onStableConnection();
-      } else if (!activeJob && opts.onQuickDisconnect()) {
+      } else if (!hasActiveWork() && opts.onQuickDisconnect()) {
         dashboard.note("Another worker instance is using this wallet — exiting");
         plainLog(
           "Disconnected repeatedly — another worker-cli process is registered with this wallet. Stop the duplicate instance.",
@@ -339,14 +375,13 @@ function runWebSocketSession(
 }
 
 export async function startWorker(options: WorkerOptions): Promise<void> {
-  const { wallet: rawWallet, backendUrl, benchmarkOnly, inference } = options;
+  const { wallet: rawWallet, backendUrl, benchmarkOnly, inference, model } = options;
   const wallet = parseWorkerWallet(rawWallet);
   const dashboardMode = !benchmarkOnly && isDashboardMode();
 
-  printStartupBanner();
-
+  const bannerLines = printStartupBanner();
   const hardwareTier = await detectHardwareTier();
-  const backend = await resolveInferenceBackend(inference);
+  const backend = await resolveInferenceBackend(inference, model);
 
   if (!dashboardMode) {
     log(`Wallet: ${shortWallet(wallet)}`);
@@ -376,7 +411,7 @@ export async function startWorker(options: WorkerOptions): Promise<void> {
       inflightJobs: null,
       workerInflightJobs: null,
       currentJob: null,
-    });
+    }, { anchorRow: bannerLines + 1 });
     dashboard.start();
     dashboard.note("Running benchmark…");
   }

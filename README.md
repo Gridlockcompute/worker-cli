@@ -70,7 +70,21 @@ node dist/index.js --help
 gridlock-native-worker --wallet 0xYourEvmAddress
 ```
 
-On first run with Ollama, the worker auto-starts Ollama if needed and pulls `llama3.1:8b`.
+On first run with Ollama, the worker lists installed models and prompts you to pick one (or pulls the default if none are installed).
+
+If you already have models, you'll see a selector like:
+
+```
+Installed Ollama models:
+
+  1. llama3.2:3b (2.0 GB)
+  2. phi3:mini (2.2 GB)
+  3. Pull llama3.1:8b (default — not installed yet)
+
+Select model [1-3, default 1]:
+```
+
+Pass `--model llama3.2:3b` or set `GRIDLOCK_OLLAMA_MODEL` to skip the prompt.
 
 Windows PowerShell example:
 
@@ -88,6 +102,7 @@ node dist/index.js --wallet 0xYourEvmAddress
 |------|---------|-------------|
 | `--wallet <address>` | — | EVM wallet address `0x…` (**required**, or set `GRIDLOCK_WALLET`) |
 | `--inference <backend>` | `auto` | `auto`, `ollama`, or `vllm` |
+| `--model <tag>` | — | Ollama model (e.g. `llama3.2:3b`); interactive picker if omitted and multiple models exist |
 | `--benchmark` | — | Run benchmark only, then exit |
 | `--version` | — | Print version |
 | `--help` | — | Print help |

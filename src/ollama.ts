@@ -1,6 +1,8 @@
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { workerLog } from "./console-io.js";
+import { isInteractiveTerminal, promptOllamaModel } from "./model-select.js";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -67,7 +69,7 @@ export async function installOllama(): Promise<void> {
     );
   }
 
-  console.log("Ollama not found — installing via https://ollama.com/install.sh …");
+  workerLog("Ollama not found — installing via https://ollama.com/install.sh …");
   const result = spawnSync("sh", ["-c", "curl -fsSL https://ollama.com/install.sh | sh"], {
     stdio: "inherit",
   });
@@ -107,34 +109,121 @@ export async function waitForOllama(baseUrl: string, timeoutMs = 45000): Promise
   return false;
 }
 
-async function modelIsAvailable(baseUrl: string, model: string): Promise<boolean> {
+export interface OllamaModelInfo {
+  name: string;
+  size: number;
+}
+
+export async function listOllamaModels(baseUrl: string): Promise<OllamaModelInfo[]> {
   try {
-    const res = await fetch(`${baseUrl}/api/tags`, { signal: AbortSignal.timeout(5000) });
-    if (!res.ok) return false;
-    const data = (await res.json()) as { models?: { name: string }[] };
-    const names = data.models?.map((m) => m.name) ?? [];
-    const base = model.split(":")[0] ?? model;
-    return names.some((n) => n === model || n.startsWith(`${base}:`));
+    const res = await fetch(`${baseUrl}/api/tags`, { signal: AbortSignal.timeout(8000) });
+    if (!res.ok) return [];
+    const data = (await res.json()) as { models?: { name?: string; size?: number }[] };
+    return (data.models ?? [])
+      .map((m) => ({ name: String(m.name ?? "").trim(), size: Number(m.size ?? 0) }))
+      .filter((m) => m.name.length > 0);
   } catch {
-    return false;
+    return [];
   }
+}
+
+export function findModelMatch(models: OllamaModelInfo[], preferred: string): string | null {
+  const want = preferred.trim();
+  if (!want) return null;
+  const names = models.map((m) => m.name);
+  if (names.includes(want)) return want;
+  const base = want.split(":", 1)[0] ?? want;
+  return names.find((n) => n === base || n.startsWith(`${base}:`)) ?? null;
+}
+
+const FALLBACK_MODEL_CANDIDATES = ["llama3.2:3b", "llama3.1:8b", "phi3:mini"];
+
+export function pickInstalledFallback(models: OllamaModelInfo[], preferred: string): string | null {
+  for (const candidate of [preferred, ...FALLBACK_MODEL_CANDIDATES]) {
+    const hit = findModelMatch(models, candidate);
+    if (hit) return hit;
+  }
+  return models[0]?.name ?? null;
+}
+
+async function modelIsAvailable(baseUrl: string, model: string): Promise<boolean> {
+  const installed = await listOllamaModels(baseUrl);
+  return findModelMatch(installed, model) !== null;
 }
 
 export async function ensureOllamaModel(baseUrl: string, binary: string, model: string): Promise<void> {
   if (await modelIsAvailable(baseUrl, model)) return;
 
-  console.log(`Pulling Ollama model ${model}… (one-time download, may take several minutes)`);
+  workerLog(`Pulling Ollama model ${model}… (one-time download, may take several minutes)`);
   const result = spawnSync(binary, ["pull", model], { stdio: "inherit" });
   if (result.status !== 0) {
     throw new Error(`Failed to pull ${model}. Run manually: ollama pull ${model}`);
   }
 }
 
-export async function bootstrapOllama(baseUrl: string, model: string): Promise<void> {
+export interface ResolveOllamaModelOptions {
+  /** User-requested model (--model); pulls if missing instead of picking another install. */
+  preferred?: string;
+  interactive?: boolean;
+}
+
+export async function resolveOllamaModel(
+  baseUrl: string,
+  binary: string,
+  options: ResolveOllamaModelOptions = {},
+): Promise<string> {
+  const explicitPreferred = Boolean(options.preferred?.trim());
+  const preferred = (options.preferred ?? process.env.GRIDLOCK_OLLAMA_MODEL ?? "llama3.1:8b").trim();
+  const interactive = options.interactive ?? isInteractiveTerminal();
+  const installed = await listOllamaModels(baseUrl);
+
+  const preferredHit = findModelMatch(installed, preferred);
+  if (preferredHit) return preferredHit;
+
+  if (explicitPreferred) {
+    workerLog(`Pulling requested Ollama model ${preferred}…`);
+    await ensureOllamaModel(baseUrl, binary, preferred);
+    return preferred;
+  }
+
+  if (installed.length === 1) {
+    const only = installed[0]!.name;
+    workerLog(`Using installed Ollama model: ${only}`);
+    return only;
+  }
+
+  if (installed.length > 1) {
+    if (interactive) {
+      const picked = await promptOllamaModel(installed, preferred);
+      if (findModelMatch(installed, picked)) return picked;
+      await ensureOllamaModel(baseUrl, binary, picked);
+      return picked;
+    }
+
+    const fallback = pickInstalledFallback(installed, preferred);
+    if (fallback) {
+      workerLog(`Using installed Ollama model: ${fallback}`);
+      return fallback;
+    }
+  }
+
+  workerLog(
+    installed.length === 0
+      ? `No Ollama models installed. Pulling ${preferred}…`
+      : `Preferred model ${preferred} not installed. Pulling…`,
+  );
+  await ensureOllamaModel(baseUrl, binary, preferred);
+  return preferred;
+}
+
+export async function bootstrapOllama(
+  baseUrl: string,
+  modelOptions: ResolveOllamaModelOptions = {},
+): Promise<string> {
   const binary = await resolveOllamaBinary();
 
   if (!(await checkOllamaAt(baseUrl))) {
-    console.log("Ollama not running — starting it…");
+    workerLog("Ollama not running — starting it…");
     startOllamaServe(binary);
     if (!(await waitForOllama(baseUrl))) {
       throw new Error(
@@ -146,5 +235,5 @@ export async function bootstrapOllama(baseUrl: string, model: string): Promise<v
     }
   }
 
-  await ensureOllamaModel(baseUrl, binary, model);
+  return resolveOllamaModel(baseUrl, binary, modelOptions);
 }

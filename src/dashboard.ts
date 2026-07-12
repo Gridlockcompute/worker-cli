@@ -5,9 +5,8 @@ const GREEN = "\x1b[32m";
 const YELLOW = "\x1b[33m";
 const RED = "\x1b[31m";
 
-/** Fixed height — variable rows broke ANSI cursor redraw. */
+/** Fixed height — keep in sync with buildLines(). */
 const FIXED_LINES = 15;
-const ACTIVITY_RENDER_MS = 60;
 
 export type ConnectionStatus = "starting" | "connected" | "disconnected" | "reconnecting";
 
@@ -47,12 +46,17 @@ export interface LiveStatsPatch {
   workerInflightJobs: number;
 }
 
+export interface DashboardOptions {
+  /** First terminal row for the dashboard box (1-based, below banner). */
+  anchorRow?: number;
+}
+
 export interface WorkerDashboard {
   update(patch: Partial<DashboardSnapshot>): void;
   applyLiveStats(stats: LiveStatsPatch): void;
   setJob(jobId: string, maxTokens: number): void;
   setJobProgress(tokens: number, maxTokens?: number): void;
-  clearJob(success: boolean, tokens: number, elapsedMs: number): void;
+  clearJob(jobId: string, success: boolean, tokens: number, elapsedMs: number): void;
   setConnection(status: ConnectionStatus): void;
   note(message: string): void;
   start(): void;
@@ -69,7 +73,7 @@ function shouldColorize(): boolean {
   return process.stdout.isTTY === true;
 }
 
-/** Interactive TTY dashboard — suppresses banner and startup log lines. */
+/** Interactive TTY dashboard — suppresses startup log lines. */
 export function isDashboardMode(): boolean {
   return shouldColorize() && process.stdout.isTTY === true;
 }
@@ -128,14 +132,18 @@ function bottomBorder(width = 76): string {
   return c(`└${"─".repeat(width - 2)}┘`, LIME);
 }
 
-export function createDashboard(initial: DashboardSnapshot): WorkerDashboard {
+export function createDashboard(
+  initial: DashboardSnapshot,
+  options: DashboardOptions = {},
+): WorkerDashboard {
   const state: DashboardSnapshot = { ...initial };
+  const anchorRow = Math.max(1, options.anchorRow ?? 1);
   const startedAt = Date.now();
-  let linesWritten = 0;
   let timer: ReturnType<typeof setInterval> | null = null;
+  let jobTimer: ReturnType<typeof setInterval> | null = null;
   let lastNote = c("—", DIM);
   let started = false;
-  let lastProgressRender = 0;
+  let renderPending = false;
 
   const enabled = shouldColorize() && process.stdout.isTTY;
 
@@ -187,42 +195,48 @@ export function createDashboard(initial: DashboardSnapshot): WorkerDashboard {
     return lines;
   }
 
-  function render(force = false) {
+  function render() {
     if (!enabled || !started) return;
-
-    const now = Date.now();
-    if (!force && state.currentJob && now - lastProgressRender < ACTIVITY_RENDER_MS) {
-      return;
-    }
-    lastProgressRender = now;
 
     const lines = buildLines();
     while (lines.length < FIXED_LINES) lines.push("");
     if (lines.length > FIXED_LINES) lines.length = FIXED_LINES;
 
-    if (linesWritten > 0) {
-      process.stdout.write(`\x1b[${linesWritten}A\x1b[0G`);
+    for (let i = 0; i < FIXED_LINES; i += 1) {
+      const rowNum = anchorRow + i;
+      process.stdout.write(`\x1b[${rowNum};1H\x1b[2K${lines[i] ?? ""}`);
     }
-    for (const line of lines) {
-      process.stdout.write("\x1b[2K");
-      process.stdout.write(line + "\n");
-    }
-    linesWritten = FIXED_LINES;
+    process.stdout.write(`\x1b[${anchorRow + FIXED_LINES};1H`);
   }
 
-  function scheduleRender(force = false) {
+  function scheduleRender() {
     if (!started) return;
-    if (force) {
-      render(true);
-      return;
-    }
-    render(false);
+    if (renderPending) return;
+    renderPending = true;
+    setImmediate(() => {
+      renderPending = false;
+      render();
+    });
+  }
+
+  function startJobTicker() {
+    stopJobTicker();
+    jobTimer = setInterval(() => {
+      if (!state.currentJob) return;
+      scheduleRender();
+    }, 100);
+  }
+
+  function stopJobTicker() {
+    if (!jobTimer) return;
+    clearInterval(jobTimer);
+    jobTimer = null;
   }
 
   return {
     update(patch) {
       Object.assign(state, patch);
-      scheduleRender(true);
+      scheduleRender();
     },
 
     applyLiveStats(stats) {
@@ -238,7 +252,7 @@ export function createDashboard(initial: DashboardSnapshot): WorkerDashboard {
         state.liveTokPerSec = stats.wsTokPerSec > 0 ? stats.wsTokPerSec : null;
       }
 
-      scheduleRender(true);
+      scheduleRender();
     },
 
     setJob(jobId, maxTokens) {
@@ -249,7 +263,8 @@ export function createDashboard(initial: DashboardSnapshot): WorkerDashboard {
         startedAt: Date.now(),
       };
       state.liveTokPerSec = 0;
-      scheduleRender(true);
+      startJobTicker();
+      scheduleRender();
     },
 
     setJobProgress(tokens, maxTokens) {
@@ -258,55 +273,55 @@ export function createDashboard(initial: DashboardSnapshot): WorkerDashboard {
       if (maxTokens !== undefined) state.currentJob.maxTokens = Math.max(1, maxTokens);
       const elapsedSec = Math.max((Date.now() - state.currentJob.startedAt) / 1000, 0.001);
       state.liveTokPerSec = Math.round((state.currentJob.tokens / elapsedSec) * 10) / 10;
-      scheduleRender(false);
+      scheduleRender();
     },
 
-    clearJob(success, tokens, elapsedMs) {
+    clearJob(jobId, success, tokens, elapsedMs) {
       if (success) {
         state.jobsCompleted += 1;
         state.tokensTodayBase += tokens;
       } else {
         state.jobsFailed += 1;
       }
+
+      if (state.currentJob?.id !== jobId) {
+        scheduleRender();
+        return;
+      }
+
       if (elapsedMs > 0 && tokens > 0) {
         state.liveTokPerSec = Math.round((tokens / (elapsedMs / 1000)) * 10) / 10;
       }
       state.currentJob = null;
-      scheduleRender(true);
+      stopJobTicker();
+      scheduleRender();
     },
 
     setConnection(status) {
       state.connection = status;
-      scheduleRender(true);
+      scheduleRender();
     },
 
     note(message) {
-      lastNote = message;
-      scheduleRender(true);
+      lastNote = message.length > 52 ? `${message.slice(0, 49)}…` : message;
+      scheduleRender();
     },
 
     start() {
       if (!enabled) return;
-      started = true;
       process.stdout.write("\x1b[?25l");
-      scheduleRender(true);
-      timer = setInterval(() => scheduleRender(true), 250);
+      started = true;
+      scheduleRender();
+      timer = setInterval(scheduleRender, 200);
     },
 
     stop() {
       if (timer) clearInterval(timer);
       timer = null;
+      stopJobTicker();
       if (!enabled || !started) return;
       started = false;
-      if (linesWritten > 0) {
-        process.stdout.write(`\x1b[${linesWritten}A\x1b[0G`);
-        for (let i = 0; i < linesWritten; i++) {
-          process.stdout.write("\x1b[2K\n");
-        }
-        process.stdout.write(`\x1b[${linesWritten}A`);
-      }
       process.stdout.write("\x1b[?25h");
-      linesWritten = 0;
     },
   };
 }

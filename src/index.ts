@@ -20,8 +20,9 @@ program
   .version(pkg.version)
   .option("--wallet <address>", "EVM wallet address (worker identity)")
   .option("--inference <backend>", "Inference backend: auto, ollama, or vllm", "auto")
+  .option("--model <tag>", "Ollama model tag (e.g. llama3.2:3b); prompts if multiple are installed")
   .option("--benchmark", "Run benchmark only, then exit")
-  .action(async (opts: { wallet?: string; inference: string; benchmark?: boolean }) => {
+  .action(async (opts: { wallet?: string; inference: string; model?: string; benchmark?: boolean }) => {
     const walletRaw = opts.wallet ?? process.env.GRIDLOCK_WALLET;
     if (!walletRaw) {
       console.error("Error: --wallet is required (or set GRIDLOCK_WALLET to your 0x EVM address).");
@@ -48,6 +49,7 @@ program
         wallet,
         backendUrl: getBackendUrl(),
         inference,
+        model: opts.model,
         benchmarkOnly: opts.benchmark ?? false,
       });
     } catch (err) {

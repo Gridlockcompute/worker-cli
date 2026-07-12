@@ -35,7 +35,8 @@ function colorize(text: string): string {
   return `${LIME_GREEN}${text}${RESET}`;
 }
 
-export function printStartupBanner(): void {
+/** Print banner; returns how many terminal rows it consumed. */
+export function printStartupBanner(): number {
   const pkg = JSON.parse(readFileSync(join(__dirname, "..", "package.json"), "utf-8")) as {
     version: string;
   };
@@ -43,4 +44,5 @@ export function printStartupBanner(): void {
   console.log(colorize(CHEVRONS));
   console.log(colorize(`  Gridlock Native Worker v${pkg.version}`));
   console.log();
+  return CHEVRONS.split("\n").length + 2;
 }
