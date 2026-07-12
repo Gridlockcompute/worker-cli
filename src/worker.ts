@@ -114,6 +114,7 @@ async function ensureRegistered(wallet: string, backendUrl: string, hardwareTier
 
   const body: Record<string, unknown> = {
     operator_address: wallet,
+    earnings_wallet: process.env.GRIDLOCK_EARNINGS_WALLET?.trim() || wallet,
     role: process.env.GRIDLOCK_ROLE ?? "Prefill",
     hardware_tier: hardwareTier,
     tee_capable: teeCapable,

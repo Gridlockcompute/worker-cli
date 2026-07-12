@@ -7,7 +7,7 @@ export function parseWorkerWallet(raw: string): `0x${string}` {
   }
   if (!isAddress(trimmed)) {
     throw new Error(
-      "Invalid EVM wallet address. Use your MetaMask 0x address (same as on https://grid-lock.tech/worker).",
+      "Invalid EVM wallet address. Use your EVM wallet 0x address (same as on https://grid-lock.tech/worker).",
     );
   }
   return getAddress(trimmed);

@@ -16,16 +16,7 @@ Headless GPU worker for the [Gridlock](https://grid-lock.tech) decentralized inf
 
 Use the same **0x EVM address** here as on the [web worker dashboard](https://grid-lock.tech/worker) so earnings, jobs, and connection status appear in one place.
 
-### GRID SLA bond (required for paid SLA jobs)
-
-When the router has `SLA_ESCROW_ONCHAIN_ENABLED=true`, workers must deposit **GRID** into the on-chain `SlaEscrow` contract before they can receive SLA-guaranteed jobs:
-
-1. Obtain GRID on Robinhood Chain
-2. Approve `SlaEscrow` to spend GRID from your worker wallet
-3. Call `deposit(amount)` on `SlaEscrow`
-4. Keep enough **available bond** to cover the max penalty for your tier (`fee × penalty_multiplier`)
-
-If a job misses its SLA, GRID is **automatically transferred from your bonded collateral to the customer wallet** — not pulled live from your wallet. Check bond status at `GET /v1/workers/{address}/bond`.
+Set your **earnings wallet** on the worker dashboard (or via `PATCH /v1/workers/{address}/earnings-wallet`). SLA misses deduct from pending worker earnings; customers receive automatic ledger credits.
 
 Stake native ETH separately from the web console for fee-share boosts — the CLI never needs your private key.
 
@@ -75,7 +66,7 @@ node dist/index.js --help
 ```bash
 # 1. Install Ollama (https://ollama.com/download) or start vLLM locally
 
-# 2. Start the worker (same 0x address as MetaMask on /worker)
+# 2. Start the worker (same wallets as registered with /worker)
 gridlock-native-worker --wallet 0xYourEvmAddress
 ```
 
