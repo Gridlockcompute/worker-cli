@@ -1,12 +1,23 @@
 {
-  "name": "@gridlock/native-worker",
+  "name": "@gridlock-compute/native-worker",
   "version": "0.1.1",
   "description": "Native CLI worker for the Gridlock inference network. Connects over WebSocket and runs jobs via Ollama or vLLM.",
   "license": "MIT",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "gridlock-native-worker": "./bin/gridlock-native-worker.cjs"
+    "gridlock-native-worker": "bin/gridlock-native-worker.cjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Gridlockcompute/worker-cli.git"
+  },
+  "homepage": "https://grid-lock.tech",
+  "bugs": {
+    "url": "https://github.com/Gridlockcompute/worker-cli/issues"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
     "build": "tsc",
@@ -16,6 +27,7 @@
   },
   "keywords": [
     "gridlock",
+    "gridlock-compute",
     "inference",
     "gpu",
     "ollama",

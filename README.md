@@ -6,7 +6,7 @@ Headless GPU worker for the [Gridlock](https://grid-lock.tech) decentralized inf
 
 ## What it is
 
-`worker-cli` (npm package `@gridlock/native-worker`) is the command-line worker client for operators who want to contribute GPU compute without a desktop UI. It:
+`worker-cli` (npm package `@gridlock-compute/native-worker`) is the command-line worker client for operators who want to contribute GPU compute without a desktop UI. It:
 
 1. Detects your hardware (GPU or CPU) and runs a short throughput benchmark
 2. Registers with the Gridlock router (`POST /v1/workers/register`) and sets status **Active** so jobs can be dispatched
@@ -41,6 +41,15 @@ Stake native ETH separately from the web console for fee-share boosts — the CL
 
 ## Installation
 
+**From npm (recommended):**
+
+```bash
+npm install -g @gridlock-compute/native-worker
+gridlock-native-worker --help
+```
+
+**From source:**
+
 ```bash
 git clone https://github.com/Gridlockcompute/worker-cli.git
 cd worker-cli
@@ -48,7 +57,7 @@ npm install
 npm run build
 ```
 
-Install globally (optional):
+Install globally from source (optional):
 
 ```bash
 npm link
