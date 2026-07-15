@@ -1,6 +1,6 @@
 {
   "name": "@gridlock-compute/native-worker",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Native CLI worker for the Gridlock inference network. Connects over WebSocket and runs jobs via Ollama or vLLM.",
   "license": "MIT",
   "type": "module",

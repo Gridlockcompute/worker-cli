@@ -1,8 +1,15 @@
-/** Gridlock API — all workers connect here. */
+/** Gridlock production API — the default router unless overridden. */
 export const GRIDLOCK_API_URL = "https://api.grid-lock.tech";
 
+let routerUrl = (process.env.GRIDLOCK_ROUTER_URL ?? GRIDLOCK_API_URL).replace(/\/$/, "");
+
+/** Override the router URL (from the --router-url CLI flag). */
+export function setRouterUrl(url: string): void {
+  routerUrl = url.replace(/\/$/, "");
+}
+
 export function getBackendUrl(): string {
-  return GRIDLOCK_API_URL;
+  return routerUrl;
 }
 
 /** @deprecated Use getBackendUrl() */

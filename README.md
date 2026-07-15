@@ -112,6 +112,7 @@ node dist/index.js --wallet 0xYourEvmAddress
 | `--wallet <address>` | — | EVM wallet address `0x…` (**required**, or set `GRIDLOCK_WALLET`) |
 | `--inference <backend>` | `auto` | `auto`, `ollama`, or `vllm` |
 | `--model <tag>` | — | Ollama model (e.g. `llama3.2:3b`); interactive picker if omitted and multiple models exist |
+| `--router-url <url>` | production API | Gridlock router URL (e.g. a local or staging router) |
 | `--benchmark` | — | Run benchmark only, then exit |
 | `--version` | — | Print version |
 | `--help` | — | Print help |
@@ -121,6 +122,7 @@ node dist/index.js --wallet 0xYourEvmAddress
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GRIDLOCK_WALLET` | — | EVM address (alternative to `--wallet`) |
+| `GRIDLOCK_ROUTER_URL` | production API | Router URL (alternative to `--router-url`) |
 | `GRIDLOCK_EARNINGS_WALLET` | operator wallet | Payout wallet sent at registration (`earnings_wallet`) |
 | `GRIDLOCK_INFERENCE` | `auto` | Inference backend: `auto`, `ollama`, or `vllm` |
 | `GRIDLOCK_OLLAMA_URL` | Ollama on this machine (port 11434) | Override if Ollama listens elsewhere |

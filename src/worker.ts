@@ -23,6 +23,18 @@ const HEARTBEAT_INTERVAL_MS = 15_000;
 const WS_PING_INTERVAL_MS = 25_000;
 const RECONNECT_DELAY_MS = 3_000;
 const DUPLICATE_DISCONNECT_THRESHOLD = 3;
+/** Max wait for in-flight jobs on shutdown; matches the router's 180s dispatch timeout. */
+const SHUTDOWN_GRACE_MS = 180_000;
+
+/** Handle for the active WS session so shutdown can drain in-flight jobs. */
+interface SessionControl {
+  ws: WebSocket;
+  hasActiveWork: () => boolean;
+  /** Resolves when the current job queue is empty. */
+  drain: () => Promise<void>;
+  /** Stop accepting new jobs and tell the router to deregister this worker. */
+  beginShutdown: () => void;
+}
 
 interface SessionContext {
   wallet: string;
@@ -31,6 +43,7 @@ interface SessionContext {
   tokPerSec: number;
   dashboard: WorkerDashboard;
   onAlreadyConnected: () => void;
+  onSessionControl: (control: SessionControl | null) => void;
 }
 
 interface WorkerOptions {
@@ -210,6 +223,7 @@ function runWebSocketSession(
   const { wallet, backendUrl, modelName, tokPerSec, dashboard, onAlreadyConnected } = ctx;
   let jobChain: Promise<void> = Promise.resolve();
   let jobsInFlight = 0;
+  let draining = false;
 
   const enqueueJob = (ws: WebSocket, job: QueuedJob) => {
     jobsInFlight += 1;
@@ -246,6 +260,18 @@ function runWebSocketSession(
 
   return new Promise((resolve) => {
     const ws = new WebSocket(wsUrl(backendUrl));
+
+    ctx.onSessionControl({
+      ws,
+      hasActiveWork,
+      drain: () => jobChain,
+      beginShutdown: () => {
+        draining = true;
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "worker:unregister", worker_address: wallet }));
+        }
+      },
+    });
 
     ws.on("open", () => {
       connectedAt = Date.now();
@@ -337,6 +363,18 @@ function runWebSocketSession(
       }
 
       if (msg.type === "job:new") {
+        if (draining) {
+          // Refuse late assignments so the router fails over fast instead
+          // of waiting out its dispatch timeout on a dying worker.
+          ws.send(
+            JSON.stringify({
+              type: "job:error",
+              job_id: String(msg.job_id),
+              error: "Worker shutting down",
+            }),
+          );
+          return;
+        }
         enqueueJob(ws, {
           jobId: String(msg.job_id),
           maxTokens: Number(msg.max_tokens ?? MAX_OUTPUT_TOKENS),
@@ -348,6 +386,7 @@ function runWebSocketSession(
 
     ws.on("close", (code, reason) => {
       cleanup();
+      ctx.onSessionControl(null);
       const livedMs = connectedAt ? Date.now() - connectedAt : 0;
       if (livedMs >= 5000) {
         opts.onStableConnection();
@@ -471,6 +510,8 @@ export async function startWorker(options: WorkerOptions): Promise<void> {
   let running = true;
   const stopLiveStats = startLiveStatsPoll(wallet, backendUrl, dashboard, () => running);
 
+  let sessionControl: SessionControl | null = null;
+
   const session: SessionContext = {
     wallet,
     backendUrl,
@@ -480,18 +521,41 @@ export async function startWorker(options: WorkerOptions): Promise<void> {
     onAlreadyConnected: () => {
       running = false;
     },
+    onSessionControl: (control) => {
+      sessionControl = control;
+    },
   };
 
   let quickDisconnects = 0;
   let hadSession = false;
 
+  let shuttingDown = false;
   const shutdown = () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     running = false;
-    stopLiveStats();
-    dashboard.note("Shutting down…");
-    dashboard.stop();
-    releaseLock();
-    plainLog("Shutting down…");
+    void (async () => {
+      const control = sessionControl;
+      if (control) {
+        control.beginShutdown();
+        if (control.hasActiveWork()) {
+          dashboard.note("Finishing in-flight job(s) — Ctrl+C again to force quit");
+          plainLog("Finishing in-flight job(s) before exit (Ctrl+C again to force quit)…");
+          await Promise.race([control.drain(), sleep(SHUTDOWN_GRACE_MS)]);
+        }
+        try {
+          control.ws.close();
+        } catch {
+          /* already closed */
+        }
+      }
+      stopLiveStats();
+      dashboard.note("Shutting down…");
+      dashboard.stop();
+      releaseLock();
+      plainLog("Shutting down…");
+      process.exit(0);
+    })();
   };
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
